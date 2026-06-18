@@ -89,11 +89,17 @@ def upload_image(file_bytes, filename="image.jpg"):
 
 def get_max_order():
     try:
-        res = requests.get(f"{FIREBASE_URL}/posts.json?shallow=true", timeout=10)
+        res = requests.get(f"{FIREBASE_URL}/posts.json", timeout=10)
         data = res.json()
-        return len(data) if data else 0
+        if not data:
+            return int(time.time() * 1000)
+        max_order = 0
+        for v in data.values():
+            if isinstance(v, dict):
+                max_order = max(max_order, v.get('order', 0))
+        return max_order + 1
     except:
-        return int(time.time() // 1000)
+        return int(time.time() * 1000)
 
 def save_to_firebase(title, image_url, terabox_url, is_premium=False):
     post_id = f"post_{int(time.time() * 1000)}"
