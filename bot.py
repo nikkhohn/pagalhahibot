@@ -19,7 +19,7 @@ PORT         = int(os.environ.get("PORT", "10000"))
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Flask app (Render web service ke liye) ──
+# ── Flask app ──
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -30,8 +30,11 @@ def home():
 def health():
     return "OK", 200
 
-# ── Post Queue (ek ek karke process ho) ──
+# ── Post Queue ──
 post_queue = Queue()
+
+# ── Shared event loop (PTB + queue worker dono isme chalenge) ──
+main_loop = None
 
 # ── Terabox domains ──
 TERABOX_DOMAINS = [
@@ -64,7 +67,6 @@ def extract_title(text):
     return None
 
 def upload_to_catbox(file_bytes, filename="image.jpg"):
-    # Primary: Catbox
     try:
         res = requests.post(
             'https://catbox.moe/user/api.php',
@@ -78,7 +80,6 @@ def upload_to_catbox(file_bytes, filename="image.jpg"):
     except Exception as e:
         log.error(f"Catbox error: {e}")
 
-    # Fallback: freeimage.host
     try:
         import base64
         b64 = base64.b64encode(file_bytes).decode()
@@ -129,22 +130,22 @@ def save_to_firebase(title, image_url, terabox_url, is_premium=False):
     )
     return res.status_code == 200, post_id
 
-# ── Queue Worker (background thread) ──
-def queue_worker():
-    """Queue se ek ek post process karo"""
+# ── Queue Worker (async, main loop pe chalta hai) ──
+async def queue_worker():
+    """Queue se ek ek post process karo — PTB ke same loop mein"""
     while True:
         try:
-            job = post_queue.get()
+            # Blocking get ko async-friendly banana
+            job = await asyncio.get_event_loop().run_in_executor(None, post_queue.get)
             if job is None:
                 break
-            asyncio.run(process_job(job))
+            await process_job(job)
             post_queue.task_done()
-            time.sleep(1)  # Har post ke baad 1 sec gap
+            await asyncio.sleep(1)
         except Exception as e:
             log.error(f"Queue worker error: {e}")
 
 async def process_job(job):
-    """Ek post ko process karo"""
     bot         = job['bot']
     chat_id     = job['chat_id']
     status_id   = job['status_id']
@@ -161,17 +162,14 @@ async def process_job(job):
 
     prefix = f"[{queue_pos}/{total}] " if total > 1 else ""
 
-    # Terabox link
     terabox_url = extract_terabox_link(text)
     if not terabox_url:
         await edit(f"{prefix}⚠️ Terabox link nahi mila!")
         return
 
-    # Title
     title = extract_title(text) or f"Video {int(time.time())}"
     is_premium = '#premium' in text.lower()
 
-    # Image upload
     image_url = None
     if file_id:
         await edit(f"{prefix}📤 Image upload ho rahi hai...")
@@ -188,7 +186,6 @@ async def process_job(job):
     else:
         image_url = "https://files.catbox.moe/placeholder.jpg"
 
-    # Firebase save
     await edit(f"{prefix}💾 Site pe save ho raha hai...")
     success, post_id = save_to_firebase(title, image_url, terabox_url, is_premium)
 
@@ -210,27 +207,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    # Sirf admin
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         await msg.reply_text("❌ Access denied!")
         return
 
     text = msg.caption or msg.text or ""
 
-    # Terabox link check
     terabox_url = extract_terabox_link(text)
     if not terabox_url:
         await msg.reply_text("⚠️ Terabox link nahi mila!\n\nFormat:\nTitle\nhttps://terabox_link")
         return
 
-    # Photo/image file_id
     file_id = None
     if msg.photo:
         file_id = msg.photo[-1].file_id
     elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith('image/'):
         file_id = msg.document.file_id
 
-    # Queue mein add karo
     queue_size = post_queue.qsize()
     status_msg = await msg.reply_text(
         f"⏳ Queue mein add hua! Position: #{queue_size + 1}" if queue_size > 0
@@ -250,24 +243,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def run_flask():
     flask_app.run(host='0.0.0.0', port=PORT)
 
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN set nahi hai!")
+async def main_async():
+    # Queue worker ko background task ke roop mein start karo
+    asyncio.create_task(queue_worker())
 
-    # Queue worker thread start karo
-    worker_thread = Thread(target=queue_worker, daemon=True)
-    worker_thread.start()
-
-    # Flask thread start karo
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    # Telegram bot start karo
+    # PTB app build aur run karo
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, handle_message))
 
     log.info(f"Bot start ho gaya! Port: {PORT}")
-    app.run_polling(allowed_updates=["message"])
+
+    # PTB 21.x mein manually initialize + start karo (run_polling ke saath async context mein)
+    async with app:
+        await app.start()
+        await app.updater.start_polling(allowed_updates=["message"])
+        # Jab tak process chale, wait karo
+        await asyncio.Event().wait()
+
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN set nahi hai!")
+
+    # Flask alag thread mein
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Sab kuch ek hi event loop mein
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
