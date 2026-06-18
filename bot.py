@@ -368,17 +368,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=PORT)
-
-def main():
+def run_bot():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN set nahi hai!")
 
     # Queue worker
     Thread(target=queue_worker, daemon=True).start()
-    # Flask
-    Thread(target=run_flask, daemon=True).start()
 
     # Bot
     app = Application.builder().token(BOT_TOKEN).build()
@@ -387,8 +382,14 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-    log.info(f"✅ Bot start ho gaya! Port: {PORT}")
-    app.run_polling(allowed_updates=["message"])
+    log.info(f"✅ Bot polling shuru ho gaya!")
+    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    import threading
+    # Bot thread mein chalao
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    log.info(f"✅ Flask server port {PORT} pe start ho raha hai...")
+    # Flask main thread mein chalao (Render ko port chahiye)
+    flask_app.run(host='0.0.0.0', port=PORT)
