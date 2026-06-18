@@ -368,28 +368,30 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-def run_bot():
+async def run_bot_async():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN set nahi hai!")
 
-    # Queue worker
-    Thread(target=queue_worker, daemon=True).start()
-
-    # Bot
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("premium", cmd_premium))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
-    log.info(f"✅ Bot polling shuru ho gaya!")
-    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
+    log.info("Bot polling shuru ho gaya!")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=["message"], drop_pending_updates=True)
+    while True:
+        await asyncio.sleep(3600)
+
+def run_bot_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_bot_async())
 
 if __name__ == "__main__":
-    import threading
-    # Bot thread mein chalao
-    bot_thread = Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    log.info(f"✅ Flask server port {PORT} pe start ho raha hai...")
-    # Flask main thread mein chalao (Render ko port chahiye)
+    Thread(target=queue_worker, daemon=True).start()
+    Thread(target=run_bot_thread, daemon=True).start()
+    log.info(f"Flask server port {PORT} pe start ho raha hai...")
     flask_app.run(host='0.0.0.0', port=PORT)
