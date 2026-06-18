@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: pagalbhabhi-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: FIREBASE_URL
+        value: https://pagalbhabhi-1ac18-default-rtdb.asia-southeast1.firebasedatabase.app
+      - key: ADMIN_ID
+        sync: false
