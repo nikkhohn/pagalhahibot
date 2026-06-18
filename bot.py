@@ -5,7 +5,6 @@ import asyncio
 import requests
 import logging
 import base64
-from queue import Queue
 from threading import Thread
 from flask import Flask
 from telegram import Update
@@ -16,6 +15,7 @@ BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 FIREBASE_URL = os.environ.get("FIREBASE_URL", "https://pagalbhabhi-1ac18-default-rtdb.asia-southeast1.firebasedatabase.app")
 ADMIN_ID     = int(os.environ.get("ADMIN_ID", "0"))
 PORT         = int(os.environ.get("PORT", "10000"))
+BOT_SECRET   = "pagalbhabhi_bot_secret_2024"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
@@ -31,8 +31,8 @@ def home():
 def health():
     return "OK", 200
 
-# ── Queue ──
-post_queue = Queue()
+# ── Semaphore — ek waqt mein sirf 1 post process ho ──
+upload_semaphore = None  # Bot loop mein initialize hoga
 
 # ── Terabox domains ──
 TERABOX_DOMAINS = [
@@ -46,22 +46,18 @@ def is_terabox(url):
     return any(d in url for d in TERABOX_DOMAINS)
 
 def extract_terabox_link(text):
-    """Pehla terabox link nikalo"""
     for url in re.findall(r'https?://[^\s\n]+', text or ''):
         if is_terabox(url.strip()):
             return url.strip()
     return None
 
 def extract_title(text):
-    """Pehli non-link, non-tag line = title"""
     for line in [l.strip() for l in (text or '').split('\n') if l.strip()]:
         if not line.startswith('http') and not line.startswith('/') and not line.startswith('#'):
             return line[:80]
     return None
 
 def upload_image(file_bytes, filename="image.jpg"):
-    """Image upload — Catbox primary, freeimage fallback"""
-    # Catbox
     try:
         res = requests.post(
             'https://catbox.moe/user/api.php',
@@ -71,12 +67,10 @@ def upload_image(file_bytes, filename="image.jpg"):
         )
         url = res.text.strip()
         if url.startswith('https://'):
-            log.info(f"Catbox upload success: {url}")
+            log.info(f"Catbox OK: {url}")
             return url
     except Exception as e:
         log.error(f"Catbox error: {e}")
-
-    # freeimage.host fallback
     try:
         b64 = base64.b64encode(file_bytes).decode()
         res2 = requests.post(
@@ -87,27 +81,22 @@ def upload_image(file_bytes, filename="image.jpg"):
         data = res2.json()
         if data.get('status_code') == 200:
             url = data['image']['url']
-            log.info(f"Freeimage upload success: {url}")
+            log.info(f"Freeimage OK: {url}")
             return url
     except Exception as e:
         log.error(f"Freeimage error: {e}")
-
     return None
 
 def get_max_order():
     try:
         res = requests.get(f"{FIREBASE_URL}/posts.json?shallow=true", timeout=10)
         data = res.json()
-        if not data:
-            return 0
-        # Count posts as order
-        return len(data)
+        return len(data) if data else 0
     except:
         return int(time.time() // 1000)
 
 def save_to_firebase(title, image_url, terabox_url, is_premium=False):
     post_id = f"post_{int(time.time() * 1000)}"
-    BOT_KEY = os.environ.get("BOT_SECRET_KEY", "pagalbhabhi_bot_secret_2024")
     post = {
         "name": title,
         "image": image_url,
@@ -116,21 +105,28 @@ def save_to_firebase(title, image_url, terabox_url, is_premium=False):
         "isNew": True,
         "order": get_max_order() + 1,
         "createdAt": int(time.time() * 1000),
-        "_botKey": BOT_KEY
+        "_botKey": BOT_SECRET
     }
-    res = requests.put(f"{FIREBASE_URL}/posts/{post_id}.json", json=post, timeout=15)
-    return res.status_code == 200, post_id
+    try:
+        res = requests.put(f"{FIREBASE_URL}/posts/{post_id}.json", json=post, timeout=15)
+        log.info(f"Firebase save status: {res.status_code}, response: {res.text[:200]}")
+        return res.status_code == 200, post_id
+    except Exception as e:
+        log.error(f"Firebase error: {e}")
+        return False, post_id
 
 def update_post_premium(post_id, is_premium):
-    res = requests.patch(
-        f"{FIREBASE_URL}/posts/{post_id}.json",
-        json={"premium": is_premium},
-        timeout=15
-    )
-    return res.status_code == 200
+    try:
+        res = requests.patch(
+            f"{FIREBASE_URL}/posts/{post_id}.json",
+            json={"premium": is_premium, "_botKey": BOT_SECRET},
+            timeout=15
+        )
+        return res.status_code == 200
+    except:
+        return False
 
 def get_recent_posts(limit=10):
-    """Recent posts fetch karo"""
     try:
         res = requests.get(f"{FIREBASE_URL}/posts.json?orderBy=\"createdAt\"&limitToLast={limit}", timeout=10)
         data = res.json()
@@ -142,146 +138,110 @@ def get_recent_posts(limit=10):
     except:
         return []
 
-# ── Queue Worker ──
-def queue_worker():
-    while True:
-        try:
-            job = post_queue.get()
-            if job is None:
-                break
-            asyncio.run(process_job(job))
-            post_queue.task_done()
-            time.sleep(1)
-        except Exception as e:
-            log.error(f"Queue worker error: {e}")
+# ── Process ek post ──
+async def process_post(update, context, text, file_id):
+    global upload_semaphore
+    msg = update.message
 
-async def process_job(job):
-    bot       = job['bot']
-    chat_id   = job['chat_id']
-    status_id = job['status_id']
-    text      = job['text']
-    file_id   = job['file_id']
-    pos       = job['pos']
-    total     = job['total']
-
-    prefix = f"[{pos}/{total}] " if total > 1 else ""
-
-    async def edit(msg):
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=status_id, text=msg)
-        except Exception as e:
-            log.error(f"Edit error: {e}")
-
-    # Terabox link
-    terabox_url = extract_terabox_link(text)
-    if not terabox_url:
-        await edit(f"{prefix}⚠️ Terabox link nahi mila!")
-        return
-
-    # Title
-    title = extract_title(text) or f"Video {pos}"
-    is_premium = '#premium' in text.lower()
-
-    # Image upload
-    image_url = None
-    if file_id:
-        await edit(f"{prefix}📤 Image upload ho rahi hai...")
-        try:
-            file = await bot.get_file(file_id)
-            file_bytes = await file.download_as_bytearray()
-            image_url = upload_image(bytes(file_bytes))
-            if not image_url:
-                await edit(f"{prefix}❌ Image upload fail! Dobara try karo.")
-                return
-        except Exception as e:
-            await edit(f"{prefix}❌ Image error: {str(e)[:100]}")
+    async with upload_semaphore:
+        terabox_url = extract_terabox_link(text)
+        if not terabox_url:
+            await msg.reply_text("⚠️ Terabox link nahi mila!")
             return
-    else:
-        image_url = "https://i.imgur.com/placeholder.jpg"
 
-    # Firebase save
-    await edit(f"{prefix}💾 Site pe save ho raha hai...")
-    success, post_id = save_to_firebase(title, image_url, terabox_url, is_premium)
+        title = extract_title(text) or f"Video {int(time.time())}"
+        is_premium = '#premium' in text.lower()
 
-    if success:
-        prem = "👑 Premium" if is_premium else "💚 Free"
-        await edit(
-            f"{prefix}✅ Post upload ho gayi!\n\n"
-            f"📌 Title: {title}\n"
-            f"🖼️ Image: ✓\n"
-            f"🔗 Link: ✓\n"
-            f"🏷️ Type: {prem}\n"
-            f"🆔 ID: `{post_id}`\n\n"
-            f"{'💡 Premium karne ke liye: /premium ' + post_id if not is_premium else ''}"
+        status_msg = await msg.reply_text("⏳ Processing...")
+
+        async def edit(text):
+            try:
+                await status_msg.edit_text(text)
+            except Exception as e:
+                log.error(f"Edit error: {e}")
+
+        # Image upload
+        image_url = None
+        if file_id:
+            await edit("📤 Image upload ho rahi hai...")
+            try:
+                file = await context.bot.get_file(file_id)
+                file_bytes = await file.download_as_bytearray()
+                # Run blocking upload in thread
+                image_url = await asyncio.get_event_loop().run_in_executor(
+                    None, upload_image, bytes(file_bytes)
+                )
+                if not image_url:
+                    await edit("❌ Image upload fail!")
+                    return
+            except Exception as e:
+                await edit(f"❌ Image error: {str(e)[:100]}")
+                return
+        else:
+            image_url = "https://files.catbox.moe/placeholder.jpg"
+
+        # Firebase save
+        await edit("💾 Site pe save ho raha hai...")
+        success, post_id = await asyncio.get_event_loop().run_in_executor(
+            None, save_to_firebase, title, image_url, terabox_url, is_premium
         )
-    else:
-        await edit(f"{prefix}❌ Firebase save fail! Dobara try karo.")
+
+        if success:
+            prem = "👑 Premium" if is_premium else "💚 Free"
+            await edit(
+                f"✅ Post upload ho gayi!\n\n"
+                f"📌 {title}\n"
+                f"🖼️ Image: ✓\n"
+                f"🔗 Link: ✓\n"
+                f"🏷️ {prem}\n"
+                f"🆔 `{post_id}`\n\n"
+                f"{'💡 /premium ' + post_id if not is_premium else ''}"
+            )
+        else:
+            await edit("❌ Firebase save fail!")
 
 # ── Handlers ──
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-
-    # Sirf admin
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         await msg.reply_text("❌ Access denied!")
         return
 
     text = msg.caption or msg.text or ""
 
-    # Terabox link check
     if not extract_terabox_link(text):
         await msg.reply_text(
             "⚠️ Terabox link nahi mila!\n\n"
-            "📋 Sahi format:\n"
-            "```\nVideo Title\nhttps://terasharelink.com/s/xxx\n```\n"
-            "+ Image attach karo",
+            "Format:\n```\nVideo Title\nhttps://terabox_link\n```\n+ Image attach karo",
             parse_mode='Markdown'
         )
         return
 
-    # Photo file_id
     file_id = None
     if msg.photo:
-        file_id = msg.photo[-1].file_id  # Pehli/sabse badi image
+        file_id = msg.photo[-1].file_id
     elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith('image/'):
         file_id = msg.document.file_id
 
-    queue_size = post_queue.qsize()
-    status_msg = await msg.reply_text(
-        f"⏳ Queue mein add hua! Position: #{queue_size + 1}\nThoda wait karo..." if queue_size > 0
-        else "⏳ Processing shuru..."
-    )
+    # Queue size batao
+    pending = upload_semaphore._value if upload_semaphore else 1
+    if pending == 0:
+        await msg.reply_text("⏳ Ek post process ho rahi hai, tumhari bari aa rahi hai...")
 
-    post_queue.put({
-        'bot':       context.bot,
-        'chat_id':   msg.chat_id,
-        'status_id': status_msg.message_id,
-        'text':      text,
-        'file_id':   file_id,
-        'pos':       queue_size + 1,
-        'total':     queue_size + 1
-    })
+    # Background task
+    asyncio.create_task(process_post(update, context, text, file_id))
 
 async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /premium post_id → post ko premium karo
-    /premium post_id free → post ko free karo
-    /premium → recent posts dikhao
-    """
     msg = update.message
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
-        await msg.reply_text("❌ Access denied!")
         return
 
     args = context.args
-
-    # /premium — recent posts dikhao
     if not args:
-        await msg.reply_text("⏳ Recent posts fetch ho rahi hain...")
-        posts = get_recent_posts(10)
+        await msg.reply_text("⏳ Posts fetch ho rahi hain...")
+        posts = await asyncio.get_event_loop().run_in_executor(None, get_recent_posts, 10)
         if not posts:
             await msg.reply_text("❌ Koi post nahi mili!")
             return
@@ -291,14 +251,13 @@ async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = p.get('name', 'No title')[:30]
             pid = p.get('id', '')
             text += f"{i}. {status} `{pid}`\n    📌 {name}\n\n"
-        text += "💡 Premium karne ke liye:\n`/premium post_id`\nFree karne ke liye:\n`/premium post_id free`"
+        text += "💡 `/premium post_id` — premium karo\n`/premium post_id free` — free karo"
         await msg.reply_text(text, parse_mode='Markdown')
         return
 
     post_id = args[0].strip()
     make_free = len(args) > 1 and args[1].lower() == 'free'
 
-    # Post exist check
     try:
         res = requests.get(f"{FIREBASE_URL}/posts/{post_id}.json", timeout=10)
         post_data = res.json()
@@ -306,45 +265,35 @@ async def cmd_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"❌ Post `{post_id}` nahi mili!", parse_mode='Markdown')
             return
     except:
-        await msg.reply_text("❌ Firebase se connect nahi ho pa raha!")
+        await msg.reply_text("❌ Firebase connect error!")
         return
 
-    # Update premium status
     new_status = not make_free
-    success = update_post_premium(post_id, new_status)
+    success = await asyncio.get_event_loop().run_in_executor(None, update_post_premium, post_id, new_status)
 
     if success:
         emoji = "👑 Premium" if new_status else "💚 Free"
-        name = post_data.get('name', 'Unknown')[:40]
         await msg.reply_text(
-            f"✅ Post update ho gayi!\n\n"
-            f"📌 {name}\n"
-            f"🏷️ Status: {emoji}\n"
+            f"✅ Updated!\n\n"
+            f"📌 {post_data.get('name','')[:40]}\n"
+            f"🏷️ {emoji}\n"
             f"🆔 `{post_id}`",
             parse_mode='Markdown'
         )
     else:
-        await msg.reply_text("❌ Update fail! Dobara try karo.")
+        await msg.reply_text("❌ Update fail!")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Queue aur bot status dikhao"""
     msg = update.message
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return
-
-    q_size = post_queue.qsize()
-    posts = get_recent_posts(5)
-
-    text = f"🤖 *Bot Status*\n\n"
-    text += f"📊 Queue: {q_size} posts pending\n\n"
-
+    posts = await asyncio.get_event_loop().run_in_executor(None, get_recent_posts, 5)
+    text = "🤖 *Bot Status: Running ✅*\n\n"
     if posts:
-        text += "📋 *Last 5 Uploads:*\n"
+        text += "📋 *Last 5 Posts:*\n"
         for p in posts:
-            status = "👑" if p.get('premium') else "💚"
-            name = p.get('name', 'No title')[:25]
-            text += f"{status} {name}\n"
-
+            s = "👑" if p.get('premium') else "💚"
+            text += f"{s} {p.get('name','')[:30]}\n"
     await msg.reply_text(text, parse_mode='Markdown')
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -352,27 +301,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return
     await msg.reply_text(
-        "📖 *Bot Commands:*\n\n"
-        "📤 *Post Upload:*\n"
-        "Image ke saath message bhejo:\n"
-        "```\nVideo Title\nhttps://terabox_link\n```\n\n"
-        "👑 *Premium Commands:*\n"
-        "`/premium` — recent posts dekho\n"
-        "`/premium post_id` — post ko premium karo\n"
-        "`/premium post_id free` — post ko free karo\n\n"
-        "📊 *Other:*\n"
-        "`/status` — bot aur queue status\n"
-        "`/help` — yeh message\n\n"
-        "💡 *Tips:*\n"
-        "• 10 posts ek saath forward karo — queue mein jayenge\n"
-        "• Pehli image aur pehla terabox link use hoga\n"
-        "• `#premium` likhne se directly premium upload hoga",
+        "📖 *Commands:*\n\n"
+        "📤 Post bhejne ka format:\n"
+        "```\nVideo Title\nhttps://terabox_link\n```\n"
+        "+ Image attach karo\n\n"
+        "👑 `/premium` — recent posts\n"
+        "👑 `/premium post_id` — premium karo\n"
+        "💚 `/premium post_id free` — free karo\n"
+        "📊 `/status` — bot status\n\n"
+        "💡 `#premium` likhne se directly premium upload hoga",
         parse_mode='Markdown'
     )
 
 async def run_bot_async():
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN set nahi hai!")
+    global upload_semaphore
+    upload_semaphore = asyncio.Semaphore(1)  # Ek waqt mein sirf 1
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("premium", cmd_premium))
@@ -393,7 +336,6 @@ def run_bot_thread():
     loop.run_until_complete(run_bot_async())
 
 if __name__ == "__main__":
-    Thread(target=queue_worker, daemon=True).start()
     Thread(target=run_bot_thread, daemon=True).start()
     log.info(f"Flask server port {PORT} pe start ho raha hai...")
     flask_app.run(host='0.0.0.0', port=PORT)
