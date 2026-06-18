@@ -107,6 +107,7 @@ def get_max_order():
 
 def save_to_firebase(title, image_url, terabox_url, is_premium=False):
     post_id = f"post_{int(time.time() * 1000)}"
+    BOT_KEY = os.environ.get("BOT_SECRET_KEY", "pagalbhabhi_bot_secret_2024")
     post = {
         "name": title,
         "image": image_url,
@@ -114,7 +115,8 @@ def save_to_firebase(title, image_url, terabox_url, is_premium=False):
         "premium": is_premium,
         "isNew": True,
         "order": get_max_order() + 1,
-        "createdAt": int(time.time() * 1000)
+        "createdAt": int(time.time() * 1000),
+        "_botKey": BOT_KEY
     }
     res = requests.put(f"{FIREBASE_URL}/posts/{post_id}.json", json=post, timeout=15)
     return res.status_code == 200, post_id
